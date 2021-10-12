@@ -11,11 +11,71 @@ import gym.spaces
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 import pfrl
 from pfrl import experiments, utils
 from pfrl.agents import PPO
 
+class QFunction(nn.Module):
+    def __init__(self,obs_size,hidden_size = 64):
+        super().__init__()
+        self.lx = nn.Linear(obs_size,hidden_size * 3)
+        self.l1 = nn.Linear(hidden_size*3,hidden_size)
+        self.l2 = nn.Linear(hidden_size*3,hidden_size)
+        self.l3 = nn.Linear(hidden_size*3,hidden_size)
+        self.l_out = nn.Linear(hidden_size*3,1)
+    def forward(self,x):
+        h1 = self.lx(x)
+        h1 = (torch.tanh(h1) * torch.sigmoid(h1))
+
+        h2 = self.l1(h1)
+        h2 = (torch.tanh(h2) * torch.sigmoid(h2))
+
+        h3 = self.l2(h1)
+        h3 = (torch.tanh(h3) * torch.sigmoid(h3))
+
+        h4 = self.l3(h1)
+        h4 = (torch.tanh(h4) * torch.sigmoid(h4))
+
+        h5 = h1 + torch.cat([h2,h3,h4],1)
+        h5 = (torch.tanh(h5) * torch.sigmoid(h5))
+
+        h_out = self.l_out(h5)
+        return h_out
+
+class PolicyFunc(nn.Module):
+    def __init__(self,action_size,obs_size,hidden_size = 64):
+        super().__init__()
+        self.lx = nn.Linear(obs_size,hidden_size * 3)
+        self.l1 = nn.Linear(hidden_size*3,hidden_size)
+        self.l2 = nn.Linear(hidden_size*3,hidden_size)
+        self.l3 = nn.Linear(hidden_size*3,hidden_size)
+        self.l_out = nn.Linear(hidden_size*3,action_size)
+        self.head = pfrl.policies.GaussianHeadWithStateIndependentCovariance(
+            action_size=action_size,
+            var_type="diagonal",
+            var_func=lambda x: torch.exp(2 * x),
+            var_param_init=0,
+        )
+    def forward(self,x):
+        h1 = self.lx(x)
+        h1 = (torch.tanh(h1) * torch.sigmoid(h1))
+
+        h2 = self.l1(h1)
+        h2 = (torch.tanh(h2) * torch.sigmoid(h2))
+
+        h3 = self.l2(h1)
+        h3 = (torch.tanh(h3) * torch.sigmoid(h3))
+
+        h4 = self.l3(h1)
+        h4 = (torch.tanh(h4) * torch.sigmoid(h4))
+
+        h5 = h1 + torch.cat([h2,h3,h4],1)
+        h5 = (torch.tanh(h5) * torch.sigmoid(h5))
+
+        h_out = self.head(self.l_out(h5))
+        return h_out
 
 def main():
     import logging
@@ -27,11 +87,11 @@ def main():
     parser.add_argument(
         "--env",
         type=str,
-        default="Hopper-v2",
+        default="HalfCheetah-v2",
         help="OpenAI Gym MuJoCo env to perform algorithm on.",
     )
     parser.add_argument(
-        "--num-envs", type=int, default=1, help="Number of envs run in parallel."
+        "--num-envs", type=int, default=6, help="Number of envs run in parallel."
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed [0, 2 ** 32)")
     parser.add_argument(
@@ -46,7 +106,7 @@ def main():
     parser.add_argument(
         "--steps",
         type=int,
-        default=2 * 10 ** 6,
+        default=1 * 10 ** 6,
         help="Total number of timesteps to train the agent.",
     )
     parser.add_argument(
@@ -150,40 +210,50 @@ def main():
 
     obs_size = obs_space.low.size
     action_size = action_space.low.size
-    policy = torch.nn.Sequential(
-        nn.Linear(obs_size, 64),
-        nn.Tanh(),
-        nn.Linear(64, 64),
-        nn.Tanh(),
-        nn.Linear(64, action_size),
-        pfrl.policies.GaussianHeadWithStateIndependentCovariance(
-            action_size=action_size,
-            var_type="diagonal",
-            var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
-            var_param_init=0,  # log std = 0 => std = 1
-        ),
-    )
+    # policy = torch.nn.Sequential(
+    #     nn.Linear(obs_size, 64),
+    #     nn.Tanh(),
+    #     nn.Linear(64, 64),
+    #     nn.Tanh(),
+    #     nn.Linear(64, action_size),
+    #     pfrl.policies.GaussianHeadWithStateIndependentCovariance(
+    #         action_size=action_size,
+    #         var_type="diagonal",
+    #         var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
+    #         var_param_init=0,  # log std = 0 => std = 1
+    #     ),
+    # )
 
-    vf = torch.nn.Sequential(
-        nn.Linear(obs_size, 64),
-        nn.Tanh(),
-        nn.Linear(64, 64),
-        nn.Tanh(),
-        nn.Linear(64, 1),
-    )
+    # vf = torch.nn.Sequential(
+    #     nn.Linear(obs_size, 64),
+    #     nn.Tanh(),
+    #     nn.Linear(64, 64),
+    #     nn.Tanh(),
+    #     nn.Linear(64, 1),
+    # )
 
-    # While the original paper initialized weights by normal distribution,
-    # we use orthogonal initialization as the latest openai/baselines does.
-    def ortho_init(layer, gain):
-        nn.init.orthogonal_(layer.weight, gain=gain)
-        nn.init.zeros_(layer.bias)
+    # # While the original paper initialized weights by normal distribution,
+    # # we use orthogonal initialization as the latest openai/baselines does.
+    # def ortho_init(layer, gain):
+    #     nn.init.orthogonal_(layer.weight, gain=gain)
+    #     nn.init.zeros_(layer.bias)
 
-    ortho_init(policy[0], gain=1)
-    ortho_init(policy[2], gain=1)
-    ortho_init(policy[4], gain=1e-2)
-    ortho_init(vf[0], gain=1)
-    ortho_init(vf[2], gain=1)
-    ortho_init(vf[4], gain=1)
+    # ortho_init(policy[0], gain=1)
+    # ortho_init(policy[2], gain=1)
+    # ortho_init(policy[4], gain=1e-2)
+    # ortho_init(vf[0], gain=1)
+    # ortho_init(vf[2], gain=1)
+    # ortho_init(vf[4], gain=1)
+
+    def init_weights(m):
+        if type(m) == nn.Linear:
+            nn.init.orthogonal_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    policy = PolicyFunc(action_size,obs_size)
+    vf = QFunction(obs_size)
+    policy.apply(init_weights)
+    vf.apply(init_weights)
 
     # Combine a policy and a value function into a single model
     model = pfrl.nn.Branched(policy, vf)
@@ -248,6 +318,7 @@ def main():
             log_interval=args.log_interval,
             max_episode_len=timestep_limit,
             save_best_so_far_agent=False,
+            use_tensorboard=True,
         )
 
 

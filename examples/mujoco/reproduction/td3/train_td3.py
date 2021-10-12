@@ -16,7 +16,88 @@ from torch import nn
 
 import pfrl
 from pfrl import experiments, explorers, replay_buffers, utils
+from pfrl.distributions import Delta
 
+class PolicyFunc(nn.Module):
+    def __init__(self,action_size,obs_size,hidden_size = 256):
+        super().__init__()
+        self.action_size = action_size
+        self.lx = nn.Linear(obs_size, hidden_size)
+        
+        self.l11 = nn.Linear(hidden_size, hidden_size)
+        self.l2 = nn.Linear(hidden_size, hidden_size)
+        self.l21 = nn.Linear(hidden_size, hidden_size)
+        self.l3 = nn.Linear(hidden_size, hidden_size)
+        self.l31 = nn.Linear(hidden_size, hidden_size)
+        self.l4 = nn.Linear(hidden_size, hidden_size)
+        self.l41 = nn.Linear(hidden_size, hidden_size)
+        self.l5 = nn.Linear(hidden_size, hidden_size)
+        self.l_out = nn.Linear(hidden_size, action_size)
+
+        # self.l1 = nn.Linear(hidden_size+obs_size,hidden_size)
+        # self.l2 = nn.Linear(hidden_size+obs_size,hidden_size)
+        # self.l3 = nn.Linear(hidden_size+obs_size,hidden_size)
+        # self.l_out = nn.Linear(hidden_size, action_size)
+
+    def forward(self,x):
+        h1 = torch.relu(self.lx(x))
+        h11 = torch.tanh(self.l11(h1)) * torch.sigmoid(self.l11(h1))
+        h2 = torch.relu(self.l2(h1 + h11))
+        h21 = torch.tanh(self.l11(h2)) * torch.sigmoid(self.l11(h2))
+        h3 = torch.relu(self.l2(h1 + h2 + h21))
+        h_out = torch.tanh(self.l_out(h3))
+        
+        # h = torch.relu(self.lx(x))
+        # h = torch.cat([x,h],1)
+        # h = torch.relu(self.l1(h))
+        # h = torch.cat([x,h],1)
+        # h = torch.relu(self.l2(h))
+        # h = torch.cat([x,h],1)
+        # h = torch.relu(self.l3(h))
+        # h_out = torch.tanh(self.l_out(h))
+
+        return torch.distributions.Independent(Delta(loc=h_out), 1)
+
+class QFunction(nn.Module):
+    def __init__(self,action_size,obs_size,hidden_size = 256):
+        super().__init__()
+        self.lx = nn.Linear(obs_size+action_size, hidden_size)
+        
+        self.l11 = nn.Linear(hidden_size, hidden_size)
+        self.l2 = nn.Linear(hidden_size, hidden_size)
+        self.l21 = nn.Linear(hidden_size, hidden_size)
+        self.l3 = nn.Linear(hidden_size, hidden_size)
+        self.l31 = nn.Linear(hidden_size, hidden_size)
+        self.l4 = nn.Linear(hidden_size, hidden_size)
+        self.l41 = nn.Linear(hidden_size, hidden_size)
+        self.l5 = nn.Linear(hidden_size, hidden_size)
+        self.l_out = nn.Linear(hidden_size,1)
+
+        # self.l1 = nn.Linear(hidden_size+obs_size+action_size,hidden_size)
+        # self.l2 = nn.Linear(hidden_size+obs_size+action_size,hidden_size)
+        # self.l3 = nn.Linear(hidden_size+obs_size+action_size,hidden_size)
+        # self.l_out = nn.Linear(hidden_size, 1)
+
+    def forward(self,x):
+        x = torch.cat(x, dim=-1)
+
+        h1 = torch.relu(self.lx(x))
+        h11 = torch.tanh(self.l11(h1)) * torch.sigmoid(self.l11(h1))
+        h2 = torch.relu(self.l2(h1 + h11))
+        h21 = torch.tanh(self.l11(h2)) * torch.sigmoid(self.l11(h2))
+        h3 = torch.relu(self.l2(h1 + h2 + h21))
+        h_out = self.l_out(h3)
+
+        # h = torch.relu(self.lx(x))
+        # h = torch.cat([x,h],1)
+        # h = torch.relu(self.l1(h))
+        # h = torch.cat([x,h],1)
+        # h = torch.relu(self.l2(h))
+        # h = torch.cat([x,h],1)
+        # h = torch.relu(self.l3(h))
+        # h_out = self.l_out(h)
+
+        return h_out
 
 def main():
 
@@ -33,7 +114,7 @@ def main():
     parser.add_argument(
         "--env",
         type=str,
-        default="Hopper-v2",
+        default="HalfCheetah-v2",
         help="OpenAI Gym MuJoCo env to perform algorithm on.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed [0, 2 ** 32)")
@@ -58,7 +139,7 @@ def main():
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=5000,
+        default=10000,
         help="Interval in timesteps between evaluations.",
     )
     parser.add_argument(
@@ -120,31 +201,46 @@ def main():
     obs_size = obs_space.low.size
     action_size = action_space.low.size
 
-    policy = nn.Sequential(
-        nn.Linear(obs_size, 400),
-        nn.ReLU(),
-        nn.Linear(400, 300),
-        nn.ReLU(),
-        nn.Linear(300, action_size),
-        nn.Tanh(),
-        pfrl.policies.DeterministicHead(),
-    )
-    policy_optimizer = torch.optim.Adam(policy.parameters())
+    # policy = nn.Sequential(
+    #     nn.Linear(obs_size, 400),
+    #     nn.ReLU(),
+    #     nn.Linear(400, 300),
+    #     nn.ReLU(),
+    #     nn.Linear(300, action_size),
+    #     nn.Tanh(),
+    #     pfrl.policies.DeterministicHead(),
+    # )
+    # policy_optimizer = torch.optim.Adam(policy.parameters())
 
-    def make_q_func_with_optimizer():
-        q_func = nn.Sequential(
-            pfrl.nn.ConcatObsAndAction(),
-            nn.Linear(obs_size + action_size, 400),
-            nn.ReLU(),
-            nn.Linear(400, 300),
-            nn.ReLU(),
-            nn.Linear(300, 1),
-        )
-        q_func_optimizer = torch.optim.Adam(q_func.parameters())
-        return q_func, q_func_optimizer
+    # def make_q_func_with_optimizer():
+    #     q_func = nn.Sequential(
+    #         pfrl.nn.ConcatObsAndAction(),
+    #         nn.Linear(obs_size + action_size, 400),
+    #         nn.ReLU(),
+    #         nn.Linear(400, 300),
+    #         nn.ReLU(),
+    #         nn.Linear(300, 1),
+    #     )
+    #     q_func_optimizer = torch.optim.Adam(q_func.parameters())
+    #     return q_func, q_func_optimizer
 
-    q_func1, q_func1_optimizer = make_q_func_with_optimizer()
-    q_func2, q_func2_optimizer = make_q_func_with_optimizer()
+    # q_func1, q_func1_optimizer = make_q_func_with_optimizer()
+    # q_func2, q_func2_optimizer = make_q_func_with_optimizer()
+    
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+
+    policy = PolicyFunc(action_size,obs_size)
+    policy.apply(init_weights)
+    policy_optimizer = torch.optim.Adam(policy.parameters(), lr=3e-4)
+    
+    q_func1 = QFunction(action_size,obs_size)
+    # q_func1.apply(init_weights)
+    q_func1_optimizer = torch.optim.Adam(q_func1.parameters(), lr=3e-4)
+    q_func2 = QFunction(action_size,obs_size)
+    # q_func2.apply(init_weights)
+    q_func2_optimizer = torch.optim.Adam(q_func2.parameters(), lr=3e-4)
 
     rbuf = replay_buffers.ReplayBuffer(10 ** 6)
 
@@ -219,6 +315,7 @@ def main():
             eval_interval=args.eval_interval,
             outdir=args.outdir,
             train_max_episode_len=timestep_limit,
+            use_tensorboard=True,
         )
 
 

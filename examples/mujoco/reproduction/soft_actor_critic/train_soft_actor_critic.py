@@ -8,17 +8,312 @@ import functools
 import logging
 import sys
 from distutils.version import LooseVersion
-
+import math
 import gym
 import gym.wrappers
 import numpy as np
 import torch
 from torch import distributions, nn
-
+from torch.nn import functional as F
 import pfrl
 from pfrl import experiments, replay_buffers, utils
 from pfrl.nn.lmbda import Lambda
+from importlib import reload
 
+reload(pfrl)
+
+def swish(x):
+    return x * torch.sigmoid(x)
+
+def glu(x):
+    return torch.tanh(x) * torch.sigmoid(x)
+
+class MaxPool1d(nn.Module):
+    def __init__(self, kernel, stride):
+        super().__init__()
+        self.max_pool_layer= nn.MaxPool1d(kernel,stride)
+    
+    def forward(self, x):
+        return torch.squeeze(self.max_pool_layer(x.unsqueeze(0)))
+
+class NoisyLinear(nn.Module):
+    """Noisy linear module for NoisyNet.
+    
+    Attributes:
+        in_features (int): input size of linear module
+        out_features (int): output size of linear module
+        std_init (float): initial std value
+        weight_mu (nn.Parameter): mean value weight parameter
+        weight_sigma (nn.Parameter): std value weight parameter
+        bias_mu (nn.Parameter): mean value bias parameter
+        bias_sigma (nn.Parameter): std value bias parameter
+        
+    """
+
+    def __init__(self, in_features: int, out_features: int, std_init: float = 0.5):
+        """Initialization."""
+        super(NoisyLinear, self).__init__()
+        
+        self.in_features = in_features
+        self.out_features = out_features
+        self.std_init = std_init
+
+        self.weight_mu = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.weight_sigma = nn.Parameter(
+            torch.Tensor(out_features, in_features)
+        )
+        self.register_buffer(
+            "weight_epsilon", torch.Tensor(out_features, in_features)
+        )
+
+        self.bias_mu = nn.Parameter(torch.Tensor(out_features))
+        self.bias_sigma = nn.Parameter(torch.Tensor(out_features))
+        self.register_buffer("bias_epsilon", torch.Tensor(out_features))
+
+        self.reset_parameters()
+        self.reset_noise()
+
+    def reset_parameters(self):
+        """Reset trainable network parameters (factorized gaussian noise)."""
+        mu_range = 1 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(
+            self.std_init / math.sqrt(self.in_features)
+        )
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(
+            self.std_init / math.sqrt(self.out_features)
+        )
+
+    def reset_noise(self):
+        """Make new noise."""
+        epsilon_in = self.scale_noise(self.in_features)
+        epsilon_out = self.scale_noise(self.out_features)
+
+        # outer product
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward method implementation.
+        
+        We don't use separate statements on train / eval mode.
+        It doesn't show remarkable difference of performance.
+        """
+        return F.linear(
+            x,
+            self.weight_mu + self.weight_sigma * self.weight_epsilon,
+            self.bias_mu + self.bias_sigma * self.bias_epsilon,
+        )
+    
+    @staticmethod
+    def scale_noise(size: int) -> torch.Tensor:
+        """Set scale to make noise (factorized gaussian noise)."""
+        x = torch.randn(size)
+
+        return x.sign().mul(x.abs().sqrt())
+
+
+class PolicyFunc(nn.Module):
+    def __init__(self,action_size,obs_size,hidden_size = 256):
+        super().__init__()
+        self.action_size = action_size
+        # self.lx = nn.Linear(obs_size, hidden_size*4)
+        # self.l1 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l11 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l2 = nn.Linear(hidden_size*2, hidden_size*2)
+        # self.l21 = nn.Linear(hidden_size*2, hidden_size*2)
+        # self.l3 = nn.Linear(hidden_size, hidden_size)
+        # self.l31 = nn.Linear(hidden_size, hidden_size)
+        # self.l4 = nn.Linear(hidden_size*2, hidden_size*2)
+        # self.l5 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l51 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l_out = nn.Linear(hidden_size*4, action_size*2)
+        # self.max_pool = nn.MaxPool1d(2,2,return_indices=True)
+        # self.max_unpool = nn.MaxUnpool1d(2,2)
+
+        # self.alpha = nn.Parameter(torch.tensor(0.5, requires_grad=True))
+        # self.beta = nn.Parameter(torch.randn(hidden_size*4, requires_grad=True))
+        # self.beta2 = nn.Parameter(torch.randn(hidden_size*4, requires_grad=True))
+        # self.bias = nn.Parameter(torch.zeros(hidden_size*4, requires_grad=True))
+
+        # nn.init.xavier_uniform_(self.beta)
+
+        # self.lx = nn.Linear(obs_size, hidden_size*4)
+        # self.l1 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l2 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l3 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l_out = nn.Linear(hidden_size*4, action_size*2)
+
+        self.lx = nn.Linear(obs_size, hidden_size*4)
+        self.l1 = nn.Linear(hidden_size*4+obs_size, hidden_size*4)
+        self.l11 = nn.Linear(hidden_size*4, hidden_size*4)
+        self.l2 = nn.Linear(hidden_size*4+obs_size, hidden_size*4)
+        self.l3 = nn.Linear(hidden_size*4+obs_size, hidden_size*4)
+        self.l_out = nn.Linear(hidden_size*4, action_size*2)
+
+        # self.lx = nn.Linear(obs_size, hidden_size*4)
+        # self.l1 = NoisyLinear(hidden_size*4+obs_size, hidden_size*4)
+        # self.l11 = NoisyLinear(hidden_size*4, hidden_size*4)
+        # self.l2 = NoisyLinear(hidden_size*4+obs_size, hidden_size*4)
+        # self.l3 = NoisyLinear(hidden_size*4+obs_size, hidden_size*4)
+        # self.l_out = NoisyLinear(hidden_size*4, action_size*2)
+
+    def forward(self,x):
+    #     h1 = torch.relu(self.lx(x))
+        
+    #     h2 = torch.relu(self.l1(h1))
+    #     h2 = h2 * torch.sigmoid(self.l11(h2))
+        
+    #     h3, indices1 = self.max_pool(h2.unsqueeze(0))
+    #     h3 = torch.squeeze(h3)
+
+    #     h4 = torch.relu(self.l2(h3))
+        
+    #     h5, indices2 = self.max_pool(h4.unsqueeze(0))
+    #     h5 = torch.squeeze(h5)
+
+    #     h6 = torch.relu(self.l3(h5))
+        
+    #     h7 = self.max_unpool(h6.unsqueeze(0), indices2)
+    #     h7 = torch.squeeze(h7)
+    #     h7 = h4+h7
+
+    #     h8 = torch.relu(self.l4(h7))
+    #     h8 = h3+h8
+
+    #     h9 = self.max_unpool(h8.unsqueeze(0), indices1)
+    #     h9 = torch.squeeze(h9)
+    #     h9 = h2+h9
+
+    #     h10 = torch.relu(self.l5(h9))
+    #    # h10 = h10 * torch.sigmoid(self.l1(h10))
+    #     h10 = h1+h10
+        
+    #     h_out = self.l_out(h10)
+
+        h = torch.relu(self.lx(x))
+        h = torch.cat([x,h],1)
+        h = torch.relu(self.l1(h))
+        # h = h * torch.sigmoid(self.l11(h))
+        h = torch.cat([x,h],1)
+        h = torch.relu(self.l2(h))
+        h = torch.cat([x,h],1)
+        h = torch.relu(self.l3(h))
+        h_out = self.l_out(h)
+
+        assert h_out.shape[-1] == self.action_size * 2
+        mean, log_scale = torch.chunk(h_out, 2, dim=1)
+        log_scale = torch.clamp(log_scale, -20.0, 2.0)
+        var = torch.exp(log_scale * 2)
+        base_distribution = distributions.Independent(
+            distributions.Normal(loc=mean, scale=torch.sqrt(var)), 1)
+        # cache_size=1 is required for numerical stability
+        return distributions.transformed_distribution.TransformedDistribution(
+            base_distribution, [distributions.transforms.TanhTransform(cache_size=1)]
+        )
+    def reset_noise(self):
+        """Reset all noisy layers."""
+        self.l1.reset_noise()
+        self.l11.reset_noise()
+        self.l2.reset_noise()
+        self.l3.reset_noise()
+        self.l_out.reset_noise()
+
+class QFunction(nn.Module):
+    def __init__(self,action_size,obs_size,hidden_size = 256):
+        super().__init__()
+        # self.lx = nn.Linear(obs_size+action_size, hidden_size*4)
+        # self.l1 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l11 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l2 = nn.Linear(hidden_size*2, hidden_size*2)
+        # self.l21 = nn.Linear(hidden_size*2, hidden_size*2)
+        # self.l3 = nn.Linear(hidden_size, hidden_size)
+        # self.l31 = nn.Linear(hidden_size, hidden_size)
+        # self.l4 = nn.Linear(hidden_size*2, hidden_size*2)
+        # self.l5 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l51 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l_out = nn.Linear(hidden_size*4, 1)
+        # self.max_pool = nn.MaxPool1d(2,2,return_indices=True)
+        # self.max_unpool = nn.MaxUnpool1d(2,2)
+
+        # self.beta = nn.Parameter(torch.randn(hidden_size*4, requires_grad=True))
+        # self.beta2 = nn.Parameter(torch.randn(hidden_size*4, requires_grad=True))
+        # self.bias = nn.Parameter(torch.zeros(hidden_size*4, requires_grad=True))
+
+        # self.lx = nn.Linear(obs_size+action_size, hidden_size*4)
+        # self.l1 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l2 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l3 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l_out = nn.Linear(hidden_size*4, 1)
+        
+        # self.lx = nn.Linear(obs_size+action_size, hidden_size*4)
+        # self.l1 = nn.Linear(hidden_size*4+obs_size+action_size, hidden_size*4)
+        # self.l11 = nn.Linear(hidden_size*4, hidden_size*4)
+        # self.l2 = nn.Linear(hidden_size*4+obs_size+action_size, hidden_size*4)
+        # self.l3 = nn.Linear(hidden_size*4+obs_size+action_size, hidden_size*4)
+        # self.l_out = nn.Linear(hidden_size*4, 1)
+
+        self.lx = nn.Linear(obs_size+action_size, hidden_size*4)
+        self.l1 = NoisyLinear(hidden_size*4+obs_size+action_size, hidden_size*4)
+        self.l11 = NoisyLinear(hidden_size*4, hidden_size*4)
+        self.l2 = NoisyLinear(hidden_size*4+obs_size+action_size, hidden_size*4)
+        self.l3 = NoisyLinear(hidden_size*4+obs_size+action_size, hidden_size*4)
+        self.l_out = NoisyLinear(hidden_size*4, 1)
+
+    def forward(self,x):
+        x = torch.cat(x, dim=-1)
+    #     h1 = torch.relu(self.lx(x))
+        
+    #     h2 = torch.relu(self.l1(h1))
+    #     h2 = h2 * torch.sigmoid(self.l11(h2))
+        
+    #     h3, indices1 = self.max_pool(h2.unsqueeze(0))
+    #     h3 = torch.squeeze(h3)
+
+    #     h4 = torch.relu(self.l2(h3))
+        
+    #     h5, indices2 = self.max_pool(h4.unsqueeze(0))
+    #     h5 = torch.squeeze(h5)
+
+    #     h6 = torch.relu(self.l3(h5))
+        
+    #     h7 = self.max_unpool(h6.unsqueeze(0), indices2)
+    #     h7 = torch.squeeze(h7)
+    #     h7 = h4+h7
+
+    #     h8 = torch.relu(self.l4(h7))
+    #     h8 = h3+h8
+
+    #     h9 = self.max_unpool(h8.unsqueeze(0), indices1)
+    #     h9 = torch.squeeze(h9)
+    #     h9 = h2+h9
+
+    #     h10 = torch.relu(self.l5(h9))
+    #    # h10 = h10 * torch.sigmoid(self.l1(h10))
+    #     h10 = h1+h10
+        
+    #     h_out = self.l_out(h10)
+
+        h = torch.relu(self.lx(x))
+        h = torch.cat([x,h],1)
+        h = torch.relu(self.l1(h))
+        # h = h * torch.sigmoid(self.l11(h))
+        h = torch.cat([x,h],1)
+        h = torch.relu(self.l2(h))
+        h = torch.cat([x,h],1)
+        h = torch.relu(self.l3(h))
+        h_out = self.l_out(h)
+
+        return h_out
+    
+    def reset_noise(self):
+        """Reset all noisy layers."""
+        self.l1.reset_noise()
+        self.l11.reset_noise()
+        self.l2.reset_noise()
+        self.l3.reset_noise()
+        self.l_out.reset_noise()
 
 def main():
 
@@ -35,11 +330,11 @@ def main():
     parser.add_argument(
         "--env",
         type=str,
-        default="Hopper-v2",
+        default="HalfCheetah-v2",
         help="OpenAI Gym MuJoCo env to perform algorithm on.",
     )
     parser.add_argument(
-        "--num-envs", type=int, default=1, help="Number of envs run in parallel."
+        "--num-envs", type=int, default=6, help="Number of envs run in parallel."
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed [0, 2 ** 32)")
     parser.add_argument(
@@ -51,19 +346,19 @@ def main():
     parser.add_argument(
         "--steps",
         type=int,
-        default=10 ** 6,
+        default=3*(10 ** 6),
         help="Total number of timesteps to train the agent.",
     )
     parser.add_argument(
         "--eval-n-runs",
         type=int,
-        default=10,
+        default=100,
         help="Number of episodes run for each evaluation.",
     )
     parser.add_argument(
         "--eval-interval",
         type=int,
-        default=5000,
+        default=20000,
         help="Interval in timesteps between evaluations.",
     )
     parser.add_argument(
@@ -170,36 +465,51 @@ def main():
             base_distribution, [distributions.transforms.TanhTransform(cache_size=1)]
         )
 
-    policy = nn.Sequential(
-        nn.Linear(obs_size, 256),
-        nn.ReLU(),
-        nn.Linear(256, 256),
-        nn.ReLU(),
-        nn.Linear(256, action_size * 2),
-        Lambda(squashed_diagonal_gaussian_head),
-    )
-    torch.nn.init.xavier_uniform_(policy[0].weight)
-    torch.nn.init.xavier_uniform_(policy[2].weight)
-    torch.nn.init.xavier_uniform_(policy[4].weight, gain=args.policy_output_scale)
+    # policy = nn.Sequential(
+    #     nn.Linear(obs_size, 256),
+    #     nn.ReLU(),
+    #     nn.Linear(256, 256),
+    #     nn.ReLU(),
+    #     nn.Linear(256, action_size * 2),
+    #     Lambda(squashed_diagonal_gaussian_head),
+    # )
+    # torch.nn.init.xavier_uniform_(policy[0].weight)
+    # torch.nn.init.xavier_uniform_(policy[2].weight)
+    # torch.nn.init.xavier_uniform_(policy[4].weight, gain=args.policy_output_scale)
+    # policy_optimizer = torch.optim.Adam(policy.parameters(), lr=3e-4)
+
+    # def make_q_func_with_optimizer():
+    #     q_func = nn.Sequential(
+    #         pfrl.nn.ConcatObsAndAction(),
+    #         nn.Linear(obs_size + action_size, 256),
+    #         nn.ReLU(),
+    #         nn.Linear(256, 256),
+    #         nn.ReLU(),
+    #         nn.Linear(256, 1),
+    #     )
+    #     torch.nn.init.xavier_uniform_(q_func[1].weight)
+    #     torch.nn.init.xavier_uniform_(q_func[3].weight)
+    #     torch.nn.init.xavier_uniform_(q_func[5].weight)
+    #     q_func_optimizer = torch.optim.Adam(q_func.parameters(), lr=3e-4)
+    #     return q_func, q_func_optimizer
+
+    # q_func1, q_func1_optimizer = make_q_func_with_optimizer()
+    # q_func2, q_func2_optimizer = make_q_func_with_optimizer()
+
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+
+    policy = PolicyFunc(action_size,obs_size)
+    policy.apply(init_weights)
     policy_optimizer = torch.optim.Adam(policy.parameters(), lr=3e-4)
-
-    def make_q_func_with_optimizer():
-        q_func = nn.Sequential(
-            pfrl.nn.ConcatObsAndAction(),
-            nn.Linear(obs_size + action_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
-        torch.nn.init.xavier_uniform_(q_func[1].weight)
-        torch.nn.init.xavier_uniform_(q_func[3].weight)
-        torch.nn.init.xavier_uniform_(q_func[5].weight)
-        q_func_optimizer = torch.optim.Adam(q_func.parameters(), lr=3e-4)
-        return q_func, q_func_optimizer
-
-    q_func1, q_func1_optimizer = make_q_func_with_optimizer()
-    q_func2, q_func2_optimizer = make_q_func_with_optimizer()
+    
+    q_func1 = QFunction(action_size,obs_size)
+    q_func1.apply(init_weights)
+    q_func1_optimizer = torch.optim.Adam(q_func1.parameters(), lr=3e-4)
+    q_func2 = QFunction(action_size,obs_size)
+    q_func2.apply(init_weights)
+    q_func2_optimizer = torch.optim.Adam(q_func2.parameters(), lr=3e-4)
 
     rbuf = replay_buffers.ReplayBuffer(10 ** 6)
 
@@ -224,7 +534,6 @@ def main():
         entropy_target=-action_size,
         temperature_optimizer_lr=3e-4,
     )
-
     if len(args.load) > 0 or args.load_pretrained:
         # either load or load_pretrained must be false
         assert not len(args.load) > 0 or not args.load_pretrained
@@ -270,6 +579,7 @@ def main():
             eval_interval=args.eval_interval,
             log_interval=args.log_interval,
             max_episode_len=timestep_limit,
+            use_tensorboard=True,
         )
 
 

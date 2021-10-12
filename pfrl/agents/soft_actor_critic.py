@@ -262,6 +262,9 @@ class SoftActorCritic(AttributeSavingMixin, BatchAgent):
             clip_l2_grad_norm_(self.q_func2.parameters(), self.max_grad_norm)
         self.q_func2_optimizer.step()
 
+        self.q_func1.reset_noise()
+        self.q_func2.reset_noise()
+
     def update_temperature(self, log_prob):
         assert not log_prob.requires_grad
         loss = -torch.mean(self.temperature_holder() * (log_prob + self.entropy_target))
@@ -294,6 +297,7 @@ class SoftActorCritic(AttributeSavingMixin, BatchAgent):
         self.policy_optimizer.step()
 
         self.n_policy_updates += 1
+        # self.policy.reset_noise()
 
         if self.entropy_target is not None:
             self.update_temperature(log_prob.detach())
